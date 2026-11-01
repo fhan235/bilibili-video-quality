@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 视频质量标注
 // @namespace    https://github.com/fhan235/bilibili-video-quality
-// @version      4.0.0
+// @version      4.0.1
 // @description  在 B 站首页、分区、热门、搜索、视频页侧边推荐、UP 主空间和视频详情页，按点赞 / 投币 / 收藏率给视频打出 S/A/B/C 质量等级，可淡化或隐藏低质视频
 // @author       fenghan
 // @match        https://www.bilibili.com/*
@@ -57,6 +57,7 @@
     const SAVE_DELAY_MS = 3000;
     const SCAN_THROTTLE_MS = 250;
     const POLL_MS = 2000;
+    const HYDRATION_TIMEOUT_MS = 20000;
 
     const SCENE_LABELS = {
         home: '首页 / 分区 / 频道页',
@@ -939,8 +940,11 @@
 
     let scanTimer = 0;
     let lastHref = location.href;
+    // 页面水合完成前不得改动页面 DOM（见 whenHydrated）
+    let domReady = false;
 
     function scanAll() {
+        if (!domReady) return;
         if (location.href !== lastHref) {
             lastHref = location.href;
             scene = pageScene();
@@ -1168,9 +1172,46 @@
 
     // ==================== 启动 ====================
 
+    /**
+     * 等待 B 站服务端渲染的页面完成水合后再回调。
+     *
+     * 视频页等页面是 Vue 2 SSR：#app 带 data-server-rendered="true"，水合完成后该属性会被移除。
+     * 如果在水合完成前往 #app 内插入任何节点，Vue 会判定 DOM 不一致、放弃水合并整页重新渲染，
+     * 导致位于 #app 内的顶栏容器 #biliMainHeader 被替换，B 站顶栏组件随后挂载崩溃，顶栏消失。
+     * 注意 window load 事件早于水合，等 load 不够。
+     */
+    function whenHydrated(callback) {
+        const pending = () => document.querySelector('[data-server-rendered="true"]');
+        if (!pending()) {
+            callback();
+            return;
+        }
+        let done = false;
+        let observer = null;
+        let poll = 0;
+        let timer = 0;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            if (observer) observer.disconnect();
+            clearInterval(poll);
+            clearTimeout(timer);
+            callback();
+        };
+        const check = () => {
+            if (!pending()) finish();
+        };
+        observer = new MutationObserver(check);
+        observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-server-rendered'], subtree: true });
+        poll = setInterval(check, 500);
+        // 兜底：页面脚本加载失败、永远不水合时，也不至于一直不工作
+        timer = setTimeout(finish, HYDRATION_TIMEOUT_MS);
+    }
+
     function boot() {
         loadCache();
         loadBaseline();
+        // 样式、悬浮提示、菜单都不会改动 #app 内部，可以立即执行
         injectStyle();
         setupTooltip();
 
@@ -1178,6 +1219,17 @@
             GM_registerMenuCommand('⚙ 视频质量标注设置', openSettings);
             GM_registerMenuCommand('🗑 清除缓存与本地基准', clearLocalData);
         }
+
+        window.addEventListener('pagehide', flushSaves);
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') flushSaves();
+        });
+
+        whenHydrated(start);
+    }
+
+    function start() {
+        domReady = true;
 
         // 只关心新增节点和链接变化（Vue 复用卡片时会原地改写 href）；
         // 忽略播放器内部（弹幕）和脚本自己的节点，避免无意义的扫描
@@ -1192,11 +1244,6 @@
         }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
 
         setInterval(scanAll, POLL_MS);
-        window.addEventListener('pagehide', flushSaves);
-        document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'hidden') flushSaves();
-        });
-
         scanAll();
     }
 
